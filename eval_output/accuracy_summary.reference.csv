@@ -1,0 +1,10 @@
+task,default
+lambada,50.80
+mmlu,19.30
+obqa,23.00
+hellaswag,10.70
+race,19.30
+siqa,28.40
+squad,30.90
+story_cloze,30.77
+tasks_average,26.65
