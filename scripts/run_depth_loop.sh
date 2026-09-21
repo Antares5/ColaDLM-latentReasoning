@@ -33,7 +33,7 @@ echo "=== depth-loop run: ${RUN_NAME} (loops=${COLA_DIT_DEPTH_LOOPS}, timesteps=
 START=$(date +%s)
 for TASK in $TASKS; do
     CUDA_VISIBLE_DEVICES=$GPU python -m cola_dlm.inference \
-        --dit_path hf_models/cola_dlm/cola_dit \
+        --dit_path "${DIT_PATH:-hf_models/cola_dlm/cola_dit}" \
         --vae_path hf_models/cola_dlm/cola_vae \
         --tokenizer_path hf_models/tokenizer.json \
         --input_jsonl "generate_task_data/${TASK}.jsonl" \

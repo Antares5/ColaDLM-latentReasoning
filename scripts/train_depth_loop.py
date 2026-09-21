@@ -19,14 +19,19 @@ depth loops R is sampled per step from ``--loop_choices`` and the loop
 index is injected through the zero-initialised ``loop_emb`` channel
 (see ``ColaDiTModel``). One checkpoint then serves every R at inference.
 
-Training layout mirrors the inference-time conditional forward exactly:
+Training layout mirrors the inference-time conditional forward exactly
+(two-pass, cache-consistent):
 
-* VAE is frozen; text windows are encoded once per batch to ``z_0``.
-* Per sample, a random target block ``b`` is picked; the NA sequence is
-  ``[z_0^(<b), z_t^(b)]`` with ``txt_q_shape = block_size``.
-* ``z_t = (1 - t/T) z_0 + (t/T) z_1``, target ``v = (z_1 - z_0) / T``
+* VAE is frozen; text windows are encoded once with the VAE to ``z_0``.
+* Per sample, a random target block ``b`` is picked. Pass 1 (no_grad)
+  commits the clean history ``z_0^(<b)`` to the DiT KV cache at ``t=0``
+  — identical to the inference-time cache write and implementing the
+  paper's stop-gradient ``sg(z_0^(<b))``. Pass 2 denoises only the noisy
+  block ``z_t^(b)`` with ``txt_q_shape = block_size``, reading the cache
+  for conditional samples and running cache-free for unconditional ones
+  (``b == 0`` or CFG dropout), matching the two CFG branch forwards.
+* ``z_t = (1 - t/T) z_0 + (t/T) z_1``, target drift ``v = z_1 - z_0``
   — the same parameterisation as the Euler update in inference.py.
-* With probability ``--cfg_dropout`` the history is emptied (uncond).
 
 Example:
     python scripts/train_depth_loop.py \
@@ -161,6 +166,7 @@ def main() -> int:
         opt = torch.optim.AdamW(dit.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     loss_hist: dict[int, list[float]] = {r: [] for r in args.loop_choices}
+    tgt_rms_hist: list[float] = []
     t_start = time.time()
     for step in range(args.max_steps):
         r = random.choice(args.loop_choices)
@@ -171,16 +177,22 @@ def main() -> int:
         batch_idx = random.sample(range(n_samples), args.batch_size)
         z0_list = [z0_all[i] for i in batch_idx]
 
-        # ---- build the NA FM batch ----------------------------------------
-        # Full clean sequence per sample with the target block replaced by
-        # its noisy interpolation z_t. Q covers every position (the
-        # block-causal mask restricts visibility to <= its own block, so
-        # the target block sees exactly {clean history, noisy block} —
-        # the training visible set V_b). Loss is taken on the target block
-        # rows only. CFG dropout: feed the noisy block with empty history.
-        txt_parts, ts_parts, targets = [], [], []
-        row_spans = []  # (start, end) of each sample's target block in the flat batch
-        offset = 0
+        # ---- build the cache-consistent NA FM batch ----------------------
+        # Two-pass layout that mirrors inference.py byte-for-byte:
+        #   pass 1 (no_grad): commit the clean history z_0^(<b) to the KV
+        #     cache at t=0. This both matches the inference-time cache
+        #     write (history K/V are produced by a separate t=0 forward,
+        #     not by the same forward that denoises the block) and
+        #     implements the paper's stop-gradient sg(z_0^(<b)) on the
+        #     visible set V_b.
+        #   pass 2: denoise the noisy target block z_t^(b) only
+        #     (txt_q_shape = block_size). Conditional samples read the
+        #     cache (use_kv_cache=True); unconditional ones (b==0 or CFG
+        #     dropout) run cache-free — the same pair of forwards the CFG
+        #     branch performs at inference time.
+        cond_txt, cond_ts, cond_targets = [], [], []
+        cond_hist, cond_hist_lens = [], []
+        unc_txt, unc_ts, unc_targets = [], [], []
         for z0 in z0_list:
             b_idx = random.randint(0, n_blocks - 1)
             drop_hist = random.random() < args.cfg_dropout
@@ -188,40 +200,64 @@ def main() -> int:
             z1 = torch.randn_like(z0_blk)
             t = random.uniform(0.0, args.T)
             z_t = (1.0 - t / args.T) * z0_blk + (t / args.T) * z1
-            if drop_hist:
-                seq, tgt_lo = z_t, 0
+            target = z1 - z0_blk
+            if drop_hist or b_idx == 0:
+                unc_txt.append(z_t)
+                unc_ts.append(t)
+                unc_targets.append(target)
             else:
-                seq = z0.clone()
-                seq[b_idx * block_size : (b_idx + 1) * block_size] = z_t
-                tgt_lo = b_idx * block_size
-            txt_parts.append(seq)
-            ts_parts.append(torch.full((seq.shape[0],), t, device=device))
-            targets.append((z1 - z0_blk) / args.T)
-            row_spans.append((offset + tgt_lo, offset + tgt_lo + block_size))
-            offset += seq.shape[0]
+                cond_txt.append(z_t)
+                cond_hist.append(z0[: b_idx * block_size])
+                cond_hist_lens.append(b_idx * block_size)
+                cond_ts.append(t)
+                cond_targets.append(target)
 
-        txt = torch.cat(txt_parts, dim=0)
-        target = torch.cat(targets, dim=0)
-        ts = torch.cat(ts_parts, dim=0)
-        txt_shape = torch.tensor([p.shape[0] for p in txt_parts], device=device).unsqueeze(1)
-        txt_q_shape = txt_shape.clone()
-
-        def _dit_fwd(t_):
+        def _dit_fwd(t_, k_shape, q_shape, ts_, use_cache):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 return dit(
                     txt=t_,
-                    txt_shape=txt_shape,
-                    txt_q_shape=txt_q_shape,
-                    timestep=ts,
+                    txt_shape=k_shape,
+                    txt_q_shape=q_shape,
+                    timestep=ts_,
                     update_kv=False,
-                    use_kv_cache=False,
+                    use_kv_cache=use_cache,
                 ).txt_sample
 
-        if args.grad_ckpt:
-            pred = torch.utils.checkpoint.checkpoint(_dit_fwd, txt.to(torch.bfloat16), use_reentrant=False)
-        else:
-            pred = _dit_fwd(txt.to(torch.bfloat16))
-        pred_rows = torch.cat([pred[s:e] for s, e in row_spans], dim=0)
+        def _block_fwd(*fwd_args):
+            if args.grad_ckpt:
+                return torch.utils.checkpoint.checkpoint(_dit_fwd, *fwd_args, use_reentrant=False)
+            return _dit_fwd(*fwd_args)
+
+        preds, targets = [], []
+        if cond_txt:
+            for blk in dit.blocks:
+                blk.set_kv_cache(True)  # enable + reset the per-sample cache
+            hist_cat = torch.cat(cond_hist, dim=0).to(torch.bfloat16)
+            hist_shape = torch.tensor(cond_hist_lens, device=device, dtype=torch.long).unsqueeze(1)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                dit(
+                    txt=hist_cat,
+                    txt_shape=hist_shape,
+                    txt_q_shape=hist_shape,
+                    timestep=torch.zeros(hist_cat.shape[0], device=device, dtype=torch.bfloat16),
+                    update_kv=True,
+                    use_kv_cache=True,
+                )
+            k_shape_c = hist_shape + block_size
+            q_shape_c = torch.full((len(cond_txt), 1), block_size, device=device, dtype=torch.long)
+            txt_c = torch.cat(cond_txt, dim=0).to(torch.bfloat16)
+            ts_c = torch.tensor(cond_ts, device=device).repeat_interleave(block_size).to(torch.bfloat16)
+            preds.append(_block_fwd(txt_c, k_shape_c, q_shape_c, ts_c, True))
+            targets.append(torch.cat(cond_targets, dim=0))
+        if unc_txt:
+            q_shape_u = torch.full((len(unc_txt), 1), block_size, device=device, dtype=torch.long)
+            txt_u = torch.cat(unc_txt, dim=0).to(torch.bfloat16)
+            ts_u = torch.tensor(unc_ts, device=device).repeat_interleave(block_size).to(torch.bfloat16)
+            preds.append(_block_fwd(txt_u, q_shape_u, q_shape_u, ts_u, False))
+            targets.append(torch.cat(unc_targets, dim=0))
+
+        target = torch.cat(targets, dim=0)
+        pred_rows = torch.cat(preds, dim=0)
         loss = F.mse_loss(pred_rows.float(), target)
 
         opt.zero_grad(set_to_none=True)
@@ -229,15 +265,22 @@ def main() -> int:
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(dit.parameters(), args.grad_clip)
         opt.step()
+        # The cache must stay populated through backward() above (gradient
+        # checkpointing recomputes the conditional forward, which reads it);
+        # it is safe to drop only now.
+        for blk in dit.blocks:
+            blk.set_kv_cache(False)
 
         loss_hist[r].append(loss.item())
+        tgt_rms_hist.append(target.pow(2).mean().sqrt().item())
         if (step + 1) % args.log_every == 0:
             msg = " | ".join(
                 f"R{k}: {sum(v[-args.log_every:]) / max(1, len(v[-args.log_every:])):.4f}"
                 for k, v in loss_hist.items()
             )
+            tgt_rms = sum(tgt_rms_hist[-args.log_every :]) / len(tgt_rms_hist[-args.log_every :])
             el = time.time() - t_start
-            print(f"[train] step {step + 1}/{args.max_steps} lr={lr_at(step, args):.2e} {msg} ({el:.0f}s)")
+            print(f"[train] step {step + 1}/{args.max_steps} lr={lr_at(step, args):.2e} {msg} tgt_rms={tgt_rms:.3f} ({el:.0f}s)")
 
         if (step + 1) % args.save_every == 0 or step + 1 == args.max_steps:
             ckpt = os.path.join(args.out_dir, f"step{step + 1}")
