@@ -1,0 +1,10 @@
+task,v3_r1,v3_r2,v3_r4,v3lr5_r2,v3lr5_r4
+lambada,39.50,0.50,0.00,1.00,0.00
+mmlu,14.00,3.00,1.00,2.50,1.00
+obqa,,,,,
+hellaswag,,,,,
+race,,,,,
+siqa,,,,,
+squad,,,,,
+story_cloze,,,,,
+tasks_average,26.75,1.75,0.50,1.75,0.50
