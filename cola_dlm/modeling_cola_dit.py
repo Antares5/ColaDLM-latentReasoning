@@ -532,9 +532,15 @@ class LoopLoRALinear(nn.Module):
         self.bias = base.bias
         self._state = state
         self.scale = 1.0  # alpha = rank
-        self.lora_A = nn.Parameter(torch.empty(max_loops - 1, rank, base.in_features))
         self.lora_B = nn.Parameter(torch.zeros(max_loops - 1, base.out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # NOTE: under ``from_pretrained`` all ``torch.nn.init.*`` calls are
+        # replaced by no-ops (transformers no_init_weights), so initialise
+        # A with plain factory ops instead of nn.init.kaiming_uniform_.
+        a = math.sqrt(5)
+        bound = math.sqrt(6.0 / ((1 + a * a) * base.in_features))
+        self.lora_A = nn.Parameter(
+            (torch.rand(max_loops - 1, rank, base.in_features) * 2.0 - 1.0) * bound
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias)
@@ -722,9 +728,13 @@ class ColaDiTModel(PreTrainedModel):
                         ),
                     )
         self.post_init()
-        nn.init.zeros_(self.loop_emb.weight)
-        if self.loop_cond == "layer":
-            nn.init.zeros_(self.loop_emb_layers.weight)
+        # NOTE: under ``from_pretrained`` torch.nn.init.* are no-ops
+        # (transformers no_init_weights), so use in-place Tensor.zero_()
+        # which is a plain tensor op and always executes.
+        with torch.no_grad():
+            self.loop_emb.weight.zero_()
+            if self.loop_cond == "layer":
+                self.loop_emb_layers.weight.zero_()
         self.depth_loops = max(1, int(os.environ.get("COLA_DIT_DEPTH_LOOPS", "1")))
         # Input re-injection flag: env var wins when explicitly set,
         # otherwise the (persisted) config value decides.
