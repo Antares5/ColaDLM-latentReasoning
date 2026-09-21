@@ -644,6 +644,12 @@ class ColaDiTModel(PreTrainedModel):
         self.post_init()
         nn.init.zeros_(self.loop_emb.weight)
         self.depth_loops = max(1, int(os.environ.get("COLA_DIT_DEPTH_LOOPS", "1")))
+        # Input re-injection flag: env var wins when explicitly set,
+        # otherwise the (persisted) config value decides.
+        env_reinject = os.environ.get("COLA_DIT_LOOP_REINJECT", "").strip()
+        self.loop_reinject = (
+            bool(int(env_reinject)) if env_reinject else bool(getattr(config, "loop_reinject", False))
+        )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -736,7 +742,13 @@ class ColaDiTModel(PreTrainedModel):
 
         cpu_txt_shape = txt_q_shape.cpu()
 
+        txt_embed = txt  # initial txt_in representation for re-injection
         for loop_idx in range(self.depth_loops):
+            # Loop-transformer-style input re-injection (loop_reinject):
+            # h <- Stack(h + x_emb) for every iteration after the first.
+            # R = 1 is unaffected, keeping single-pass behaviour exact.
+            if loop_idx > 0 and self.loop_reinject:
+                txt = txt + txt_embed
             # Only the final loop iteration may append to the KV cache;
             # earlier iterations read the same history without committing.
             loop_update_kv = update_kv and loop_idx == self.depth_loops - 1

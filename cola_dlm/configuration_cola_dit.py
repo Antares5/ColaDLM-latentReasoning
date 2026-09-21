@@ -67,6 +67,7 @@ class ColaDiTConfig(PretrainedConfig):
         patch_size: int = 1,
         rope_dim: int = 96,
         block_size: int = 4,
+        loop_reinject: bool = False,
         **kwargs,
     ):
         self.txt_in_channels = txt_in_channels
@@ -82,4 +83,9 @@ class ColaDiTConfig(PretrainedConfig):
         self.patch_size = patch_size
         self.rope_dim = rope_dim
         self.block_size = block_size
+        # Loop-transformer-style input re-injection: at each depth-loop
+        # iteration r >= 1, add the initial txt_in representation back to
+        # the hidden state (h <- Stack(h + x_emb)). Persisted in the
+        # checkpoint config; env COLA_DIT_LOOP_REINJECT overrides at load.
+        self.loop_reinject = loop_reinject
         super().__init__(**kwargs)

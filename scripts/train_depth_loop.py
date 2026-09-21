@@ -80,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--loop_choices", type=int, nargs="+", default=[1, 2, 4])
+    p.add_argument("--loop_reinject", type=int, default=0,
+                   help="Enable loop-transformer-style input re-injection (x_emb added back "
+                        "to the hidden state at every loop iteration r>=1)")
     p.add_argument("--cfg_dropout", type=float, default=0.1)
     p.add_argument("--T", type=float, default=1000.0)
     p.add_argument("--save_every", type=int, default=250)
@@ -152,6 +155,9 @@ def main() -> int:
 
     print(f"[train] loading DiT: {args.dit_path}")
     dit = ColaDiTModel.from_pretrained(args.dit_path).to(device)
+    if args.loop_reinject:
+        dit.loop_reinject = True
+        dit.config.loop_reinject = True  # persist into the saved checkpoint
     dit.train()
     max_loops = max(args.loop_choices)
     assert max_loops <= dit.max_depth_loops, (
