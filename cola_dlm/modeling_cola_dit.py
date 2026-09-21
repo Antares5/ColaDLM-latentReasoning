@@ -628,14 +628,21 @@ class ColaDiTModel(PreTrainedModel):
             patch_size=config.patch_size,
             dim=config.txt_dim,
         )
-        self.post_init()
-
         # Experimental depth looping (training-free test-time compute):
         # apply the whole block stack ``depth_loops`` times per forward.
         # Default 1 reproduces the original model exactly. Only the last
         # loop iteration is allowed to append to the KV cache, so cache
         # bookkeeping (and the "commit final representation" semantics)
         # is identical to the single-pass model.
+        #
+        # ``loop_emb`` conditions each loop iteration on its index r and is
+        # zero-initialised: at init (and for the released checkpoint, which
+        # carries no such weights) the model is exactly the original one.
+        # It only becomes active when fine-tuned with depth looping.
+        self.max_depth_loops = max(1, int(os.environ.get("COLA_DIT_MAX_LOOPS", "8")))
+        self.loop_emb = nn.Embedding(self.max_depth_loops, config.emb_dim)
+        self.post_init()
+        nn.init.zeros_(self.loop_emb.weight)
         self.depth_loops = max(1, int(os.environ.get("COLA_DIT_DEPTH_LOOPS", "1")))
 
     def _init_weights(self, module):
@@ -733,12 +740,14 @@ class ColaDiTModel(PreTrainedModel):
             # Only the final loop iteration may append to the KV cache;
             # earlier iterations read the same history without committing.
             loop_update_kv = update_kv and loop_idx == self.depth_loops - 1
+            # Zero-initialised per-loop conditioning: inactive until trained.
+            emb_loop = emb + self.loop_emb.weight[loop_idx].to(emb.dtype)
             for block in self.blocks:
                 txt = block(
                     txt,
                     txt_shape=txt_shape_patched,
                     txt_q_shape=txt_q_shape,
-                    emb=emb,
+                    emb=emb_loop,
                     update_kv=loop_update_kv,
                     use_kv_cache=use_kv_cache,
                     attn_block_mask=attn_mask,
