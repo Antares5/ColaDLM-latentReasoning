@@ -69,6 +69,7 @@ class ColaDiTConfig(PretrainedConfig):
         block_size: int = 4,
         loop_reinject: bool = False,
         loop_cond: str = "global",
+        loop_lora_rank: int = 0,
         **kwargs,
     ):
         self.txt_in_channels = txt_in_channels
@@ -95,4 +96,8 @@ class ColaDiTConfig(PretrainedConfig):
         # FiLM on the residual stream). Persisted in the checkpoint config;
         # env COLA_DIT_LOOP_COND overrides at load.
         self.loop_cond = loop_cond
+        # Per-loop LoRA rank on attention/MLP projections (0 = off).
+        # Persisted in the checkpoint config; env COLA_DIT_LOOP_LORA_RANK
+        # overrides at load.
+        self.loop_lora_rank = loop_lora_rank
         super().__init__(**kwargs)

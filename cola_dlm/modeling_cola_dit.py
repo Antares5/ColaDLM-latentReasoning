@@ -509,6 +509,41 @@ class ColaDiTAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class LoopLoRALinear(nn.Module):
+    """Per-loop LoRA wrapper around a base ``nn.Linear``.
+
+    The wrapped layer keeps the base ``weight`` / ``bias`` parameters under
+    their original names, so checkpoints saved before LoRA existed load
+    unchanged (the new ``lora_A`` / ``lora_B`` keys simply warn as missing).
+    Loop iteration 0 always uses the bare base weights; iterations r >= 1
+    add their own low-rank delta ``B_r A_r x`` (B zero-initialised, so at
+    init every loop is exactly the base layer). The current loop index is
+    read from a shared mutable state dict that ``ColaDiTModel.forward``
+    updates per iteration — safe under ``torch.utils.checkpoint`` because
+    the checkpoint boundary wraps the whole loop, so recomputation replays
+    the same index sequence.
+    """
+
+    def __init__(self, base: nn.Linear, max_loops: int, rank: int, state: dict):
+        super().__init__()
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        self.weight = base.weight
+        self.bias = base.bias
+        self._state = state
+        self.scale = 1.0  # alpha = rank
+        self.lora_A = nn.Parameter(torch.empty(max_loops - 1, rank, base.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(max_loops - 1, base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias)
+        idx = self._state["idx"]
+        if idx > 0:
+            y = y + (x @ self.lora_A[idx - 1].t()) @ self.lora_B[idx - 1].t() * self.scale
+        return y
+
+
 class ColaDiTBlock(nn.Module):
     def __init__(self, txt_dim, emb_dim, heads, head_dim, expand_ratio, norm_eps, qk_bias, rope_dim, block_size):
         super().__init__()
@@ -660,6 +695,32 @@ class ColaDiTModel(PreTrainedModel):
             )
         elif self.loop_cond != "global":
             raise ValueError(f"unknown loop_cond: {self.loop_cond!r}")
+        # Per-loop LoRA: each loop iteration r >= 1 gets its own low-rank
+        # delta on the attention QKV/out and MLP in/out projections of
+        # every block (loop 0 = bare base weights). This is the strongest
+        # form of loop specialisation: the shared stack can actually
+        # compute a *different function* per iteration, not just a
+        # different modulation of the same function. B is zero-init, so
+        # at init all loops equal the base model. Rank is persisted in
+        # the checkpoint config; env COLA_DIT_LOOP_LORA_RANK overrides.
+        self._loop_state = {"idx": 0}
+        env_rank = os.environ.get("COLA_DIT_LOOP_LORA_RANK", "").strip()
+        self.loop_lora_rank = int(env_rank) if env_rank else int(getattr(config, "loop_lora_rank", 0) or 0)
+        if self.loop_lora_rank > 0:
+            for blk in self.blocks:
+                for holder, name in (
+                    (blk.msa, "proj_qkv"),
+                    (blk.msa, "proj_out"),
+                    (blk.mlp, "proj_in"),
+                    (blk.mlp, "proj_out"),
+                ):
+                    setattr(
+                        holder,
+                        name,
+                        LoopLoRALinear(
+                            getattr(holder, name), self.max_depth_loops, self.loop_lora_rank, self._loop_state
+                        ),
+                    )
         self.post_init()
         nn.init.zeros_(self.loop_emb.weight)
         if self.loop_cond == "layer":
@@ -765,6 +826,7 @@ class ColaDiTModel(PreTrainedModel):
 
         txt_embed = txt  # initial txt_in representation for re-injection
         for loop_idx in range(self.depth_loops):
+            self._loop_state["idx"] = loop_idx  # read by LoopLoRALinear
             # Loop-transformer-style input re-injection (loop_reinject):
             # h <- Stack(h + x_emb) for every iteration after the first.
             # R = 1 is unaffected, keeping single-pass behaviour exact.
@@ -803,6 +865,7 @@ class ColaDiTModel(PreTrainedModel):
                     k_position_ids=k_position_ids,
                     q_position_ids=q_position_ids,
                 )
+        self._loop_state["idx"] = 0
 
         if self.txt_out_norm is not None:
             txt = self.txt_out_ada(

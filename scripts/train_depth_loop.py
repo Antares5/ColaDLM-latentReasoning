@@ -89,7 +89,10 @@ def parse_args() -> argparse.Namespace:
                         "FiLM on the residual stream")
     p.add_argument("--cond_lr_mult", type=float, default=1.0,
                    help="Learning-rate multiplier for the loop-conditioning parameters "
-                        "(loop_emb / loop_emb_layers / loop_film) relative to --lr")
+                        "(loop_emb / loop_emb_layers / loop_film / lora_A / lora_B) relative to --lr")
+    p.add_argument("--loop_lora_rank", type=int, default=0,
+                   help="Per-loop LoRA rank on attention/MLP projections (0 = off). "
+                        "Loop iteration r>=1 gets its own low-rank delta per projection.")
     p.add_argument("--cfg_dropout", type=float, default=0.1)
     p.add_argument("--T", type=float, default=1000.0)
     p.add_argument("--save_every", type=int, default=250)
@@ -166,12 +169,16 @@ def main() -> int:
         # the mode must be visible via env when fine-tuning a checkpoint
         # whose config predates them.
         os.environ["COLA_DIT_LOOP_COND"] = args.loop_cond
+    if args.loop_lora_rank > 0:
+        os.environ["COLA_DIT_LOOP_LORA_RANK"] = str(args.loop_lora_rank)
     dit = ColaDiTModel.from_pretrained(args.dit_path).to(device)
     if args.loop_reinject:
         dit.loop_reinject = True
         dit.config.loop_reinject = True  # persist into the saved checkpoint
     if args.loop_cond != "global":
         dit.config.loop_cond = args.loop_cond  # persist into the saved checkpoint
+    if args.loop_lora_rank > 0:
+        dit.config.loop_lora_rank = args.loop_lora_rank  # persist into the saved checkpoint
     dit.train()
     max_loops = max(args.loop_choices)
     assert max_loops <= dit.max_depth_loops, (
@@ -179,8 +186,14 @@ def main() -> int:
     )
 
     cond_param_names = {"loop_emb.weight", "loop_emb_layers.weight", "loop_film"}
-    cond_params = [p for n, p in dit.named_parameters() if n in cond_param_names]
-    base_params = [p for n, p in dit.named_parameters() if n not in cond_param_names]
+    cond_params = [
+        p for n, p in dit.named_parameters()
+        if n in cond_param_names or n.endswith(("lora_A", "lora_B"))
+    ]
+    base_params = [
+        p for n, p in dit.named_parameters()
+        if not (n in cond_param_names or n.endswith(("lora_A", "lora_B")))
+    ]
     param_groups = [
         {"params": base_params, "lr_mult": 1.0},
         {"params": cond_params, "lr_mult": args.cond_lr_mult},
