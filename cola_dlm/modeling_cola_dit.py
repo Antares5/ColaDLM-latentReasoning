@@ -68,6 +68,7 @@ trainer and does not need a separate pad-offset correction term.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Union
@@ -629,6 +630,14 @@ class ColaDiTModel(PreTrainedModel):
         )
         self.post_init()
 
+        # Experimental depth looping (training-free test-time compute):
+        # apply the whole block stack ``depth_loops`` times per forward.
+        # Default 1 reproduces the original model exactly. Only the last
+        # loop iteration is allowed to append to the KV cache, so cache
+        # bookkeeping (and the "commit final representation" semantics)
+        # is identical to the single-pass model.
+        self.depth_loops = max(1, int(os.environ.get("COLA_DIT_DEPTH_LOOPS", "1")))
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
@@ -720,19 +729,23 @@ class ColaDiTModel(PreTrainedModel):
 
         cpu_txt_shape = txt_q_shape.cpu()
 
-        for block in self.blocks:
-            txt = block(
-                txt,
-                txt_shape=txt_shape_patched,
-                txt_q_shape=txt_q_shape,
-                emb=emb,
-                update_kv=update_kv,
-                use_kv_cache=use_kv_cache,
-                attn_block_mask=attn_mask,
-                cpu_txt_shape=cpu_txt_shape,
-                k_position_ids=k_position_ids,
-                q_position_ids=q_position_ids,
-            )
+        for loop_idx in range(self.depth_loops):
+            # Only the final loop iteration may append to the KV cache;
+            # earlier iterations read the same history without committing.
+            loop_update_kv = update_kv and loop_idx == self.depth_loops - 1
+            for block in self.blocks:
+                txt = block(
+                    txt,
+                    txt_shape=txt_shape_patched,
+                    txt_q_shape=txt_q_shape,
+                    emb=emb,
+                    update_kv=loop_update_kv,
+                    use_kv_cache=use_kv_cache,
+                    attn_block_mask=attn_mask,
+                    cpu_txt_shape=cpu_txt_shape,
+                    k_position_ids=k_position_ids,
+                    q_position_ids=q_position_ids,
+                )
 
         if self.txt_out_norm is not None:
             txt = self.txt_out_ada(
