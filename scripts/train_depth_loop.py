@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loop_reinject", type=int, default=0,
                    help="Enable loop-transformer-style input re-injection (x_emb added back "
                         "to the hidden state at every loop iteration r>=1)")
+    p.add_argument("--loop_cond", choices=["global", "layer", "film"], default="global",
+                   help="Per-loop conditioning mode: global = shared loop_emb vector; "
+                        "layer = per-(loop, layer) AdaLN embedding; film = per-(loop, layer) "
+                        "FiLM on the residual stream")
+    p.add_argument("--cond_lr_mult", type=float, default=1.0,
+                   help="Learning-rate multiplier for the loop-conditioning parameters "
+                        "(loop_emb / loop_emb_layers / loop_film) relative to --lr")
     p.add_argument("--cfg_dropout", type=float, default=0.1)
     p.add_argument("--T", type=float, default=1000.0)
     p.add_argument("--save_every", type=int, default=250)
@@ -154,22 +161,36 @@ def main() -> int:
     n_samples = len(z0_all)
 
     print(f"[train] loading DiT: {args.dit_path}")
+    if args.loop_cond != "global":
+        # The conditioning parameters are created at construction time, so
+        # the mode must be visible via env when fine-tuning a checkpoint
+        # whose config predates them.
+        os.environ["COLA_DIT_LOOP_COND"] = args.loop_cond
     dit = ColaDiTModel.from_pretrained(args.dit_path).to(device)
     if args.loop_reinject:
         dit.loop_reinject = True
         dit.config.loop_reinject = True  # persist into the saved checkpoint
+    if args.loop_cond != "global":
+        dit.config.loop_cond = args.loop_cond  # persist into the saved checkpoint
     dit.train()
     max_loops = max(args.loop_choices)
     assert max_loops <= dit.max_depth_loops, (
         f"loop choice {max_loops} exceeds COLA_DIT_MAX_LOOPS={dit.max_depth_loops}"
     )
 
+    cond_param_names = {"loop_emb.weight", "loop_emb_layers.weight", "loop_film"}
+    cond_params = [p for n, p in dit.named_parameters() if n in cond_param_names]
+    base_params = [p for n, p in dit.named_parameters() if n not in cond_param_names]
+    param_groups = [
+        {"params": base_params, "lr_mult": 1.0},
+        {"params": cond_params, "lr_mult": args.cond_lr_mult},
+    ]
     if args.optimizer == "adamw8bit":
         import bitsandbytes as bnb
 
-        opt = bnb.optim.PagedAdamW8bit(dit.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt = bnb.optim.PagedAdamW8bit(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
-        opt = torch.optim.AdamW(dit.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
 
     loss_hist: dict[int, list[float]] = {r: [] for r in args.loop_choices}
     tgt_rms_hist: list[float] = []
@@ -177,8 +198,9 @@ def main() -> int:
     for step in range(args.max_steps):
         r = random.choice(args.loop_choices)
         dit.depth_loops = r
+        lr_now = lr_at(step, args)
         for g in opt.param_groups:
-            g["lr"] = lr_at(step, args)
+            g["lr"] = lr_now * g["lr_mult"]
 
         batch_idx = random.sample(range(n_samples), args.batch_size)
         z0_list = [z0_all[i] for i in batch_idx]

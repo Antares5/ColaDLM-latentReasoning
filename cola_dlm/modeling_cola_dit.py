@@ -641,8 +641,29 @@ class ColaDiTModel(PreTrainedModel):
         # It only becomes active when fine-tuned with depth looping.
         self.max_depth_loops = max(1, int(os.environ.get("COLA_DIT_MAX_LOOPS", "8")))
         self.loop_emb = nn.Embedding(self.max_depth_loops, config.emb_dim)
+        # Per-loop conditioning mode: "global" keeps the single shared
+        # loop_emb vector; "layer" adds a per-(loop, layer) embedding fed
+        # to each block's AdaLN (the AdaLN-native form of per-loop
+        # LayerNorm); "film" adds per-(loop, layer) FiLM scale/shift
+        # applied to the residual stream before each block. All extra
+        # parameters are zero-initialised, so every mode starts exactly
+        # at the single-pass model. Env COLA_DIT_LOOP_COND overrides the
+        # config value (needed to create the parameters when fine-tuning
+        # from a checkpoint whose config predates them).
+        env_cond = os.environ.get("COLA_DIT_LOOP_COND", "").strip()
+        self.loop_cond = env_cond or getattr(config, "loop_cond", "global")
+        if self.loop_cond == "layer":
+            self.loop_emb_layers = nn.Embedding(self.max_depth_loops * config.num_layers, config.emb_dim)
+        elif self.loop_cond == "film":
+            self.loop_film = nn.Parameter(
+                torch.zeros(self.max_depth_loops, config.num_layers, 2, config.txt_dim)
+            )
+        elif self.loop_cond != "global":
+            raise ValueError(f"unknown loop_cond: {self.loop_cond!r}")
         self.post_init()
         nn.init.zeros_(self.loop_emb.weight)
+        if self.loop_cond == "layer":
+            nn.init.zeros_(self.loop_emb_layers.weight)
         self.depth_loops = max(1, int(os.environ.get("COLA_DIT_DEPTH_LOOPS", "1")))
         # Input re-injection flag: env var wins when explicitly set,
         # otherwise the (persisted) config value decides.
@@ -754,12 +775,27 @@ class ColaDiTModel(PreTrainedModel):
             loop_update_kv = update_kv and loop_idx == self.depth_loops - 1
             # Zero-initialised per-loop conditioning: inactive until trained.
             emb_loop = emb + self.loop_emb.weight[loop_idx].to(emb.dtype)
-            for block in self.blocks:
+            if self.loop_cond == "layer":
+                # Per-(loop, layer) conditioning: each block's AdaLN gets
+                # its own loop embedding on top of the shared one.
+                base = loop_idx * len(self.blocks)
+                emb_per_layer = [
+                    emb_loop + self.loop_emb_layers.weight[base + i].to(emb.dtype)
+                    for i in range(len(self.blocks))
+                ]
+            else:
+                emb_per_layer = [emb_loop] * len(self.blocks)
+            film = self.loop_film[loop_idx] if self.loop_cond == "film" else None
+            for layer_i, block in enumerate(self.blocks):
+                if film is not None:
+                    # FiLM on the residual stream: h <- h*(1+g) + b,
+                    # zero-init so iteration 0 / untrained = identity.
+                    txt = txt * (1.0 + film[layer_i, 0].to(txt.dtype)) + film[layer_i, 1].to(txt.dtype)
                 txt = block(
                     txt,
                     txt_shape=txt_shape_patched,
                     txt_q_shape=txt_q_shape,
-                    emb=emb_loop,
+                    emb=emb_per_layer[layer_i],
                     update_kv=loop_update_kv,
                     use_kv_cache=use_kv_cache,
                     attn_block_mask=attn_mask,

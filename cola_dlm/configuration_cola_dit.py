@@ -68,6 +68,7 @@ class ColaDiTConfig(PretrainedConfig):
         rope_dim: int = 96,
         block_size: int = 4,
         loop_reinject: bool = False,
+        loop_cond: str = "global",
         **kwargs,
     ):
         self.txt_in_channels = txt_in_channels
@@ -88,4 +89,10 @@ class ColaDiTConfig(PretrainedConfig):
         # the hidden state (h <- Stack(h + x_emb)). Persisted in the
         # checkpoint config; env COLA_DIT_LOOP_REINJECT overrides at load.
         self.loop_reinject = loop_reinject
+        # Per-loop conditioning mode: "global" (one loop_emb vector shared
+        # by all layers), "layer" (per-layer loop embedding, the AdaLN
+        # native form of per-loop LayerNorm), "film" (per-loop per-layer
+        # FiLM on the residual stream). Persisted in the checkpoint config;
+        # env COLA_DIT_LOOP_COND overrides at load.
+        self.loop_cond = loop_cond
         super().__init__(**kwargs)
