@@ -67,6 +67,7 @@ inference therefore sees the same flattened layout as the original
 trainer and does not need a separate pad-offset correction term.
 """
 
+import contextlib
 import math
 import os
 from dataclasses import dataclass
@@ -701,6 +702,38 @@ class ColaDiTModel(PreTrainedModel):
             )
         elif self.loop_cond != "global":
             raise ValueError(f"unknown loop_cond: {self.loop_cond!r}")
+        # Huginn-style concat adapter: at loop iterations r >= 1, the hidden
+        # state is re-combined with the initial txt_in representation via a
+        # learned adapter h <- A([h; x_emb]) with A: R^{2h} -> R^h, instead
+        # of plain additive re-injection (which our v4 experiments showed
+        # to be insufficient; Geiping et al. 2025 ablate concat > add at
+        # scale). Initialised as [I | 0] so iteration 1+ starts exactly at
+        # the un-adapted model. Env COLA_DIT_LOOP_ADAPTER overrides config.
+        env_adapter = os.environ.get("COLA_DIT_LOOP_ADAPTER", "").strip()
+        self.loop_adapter_enabled = (
+            bool(int(env_adapter)) if env_adapter else bool(getattr(config, "loop_adapter", False))
+        )
+        if self.loop_adapter_enabled:
+            self.loop_adapter = nn.Linear(2 * config.txt_dim, config.txt_dim, bias=False)
+            with torch.no_grad():
+                self.loop_adapter.weight.zero_()
+                self.loop_adapter.weight[:, : config.txt_dim] = torch.eye(config.txt_dim)
+        # Truncated backprop through the depth loop (Huginn-style TBPTT):
+        # iterations [0, depth_loops - tbptt_k) run under no_grad, only the
+        # last tbptt_k iterations build a graph. 0 = full backprop.
+        self.tbptt_k = max(0, int(os.environ.get("COLA_DIT_TBPTT_K", "0")))
+        # Optional RMS renormalisation of the hidden state at every loop
+        # boundary (no affine). Directly targets the zero-shot token
+        # collapse our probe shows across loops (off-diag cosine ~0.9):
+        # Huginn cured the same failure with sandwich norms from scratch;
+        # this is the least invasive equivalent for a converged checkpoint.
+        env_renorm = os.environ.get("COLA_DIT_LOOP_RENORM", "").strip()
+        self.loop_renorm = (
+            bool(int(env_renorm)) if env_renorm else bool(getattr(config, "loop_renorm", False))
+        )
+        # Optional per-loop probe: set self._probe = [] to collect
+        # (loop_idx, hidden RMS, off-diagonal token cosine) per iteration.
+        self._probe: Optional[list] = None
         # Per-loop LoRA: each loop iteration r >= 1 gets its own low-rank
         # delta on the attention QKV/out and MLP in/out projections of
         # every block (loop 0 = bare base weights). This is the strongest
@@ -835,6 +868,7 @@ class ColaDiTModel(PreTrainedModel):
         cpu_txt_shape = txt_q_shape.cpu()
 
         txt_embed = txt  # initial txt_in representation for re-injection
+        tbptt_free = self.depth_loops - min(self.tbptt_k, self.depth_loops)
         for loop_idx in range(self.depth_loops):
             self._loop_state["idx"] = loop_idx  # read by LoopLoRALinear
             # Loop-transformer-style input re-injection (loop_reinject):
@@ -842,6 +876,13 @@ class ColaDiTModel(PreTrainedModel):
             # R = 1 is unaffected, keeping single-pass behaviour exact.
             if loop_idx > 0 and self.loop_reinject:
                 txt = txt + txt_embed
+            # Huginn-style concat adapter (supersedes additive re-injection):
+            # h <- A([h; x_emb]), A initialised to [I | 0].
+            if loop_idx > 0 and self.loop_adapter_enabled:
+                txt = self.loop_adapter(torch.cat([txt, txt_embed], dim=-1))
+            # Anti-collapse RMS renormalisation at the loop boundary.
+            if loop_idx > 0 and self.loop_renorm:
+                txt = F.rms_norm(txt, (txt.shape[-1],))
             # Only the final loop iteration may append to the KV cache;
             # earlier iterations read the same history without committing.
             loop_update_kv = update_kv and loop_idx == self.depth_loops - 1
@@ -858,23 +899,45 @@ class ColaDiTModel(PreTrainedModel):
             else:
                 emb_per_layer = [emb_loop] * len(self.blocks)
             film = self.loop_film[loop_idx] if self.loop_cond == "film" else None
-            for layer_i, block in enumerate(self.blocks):
-                if film is not None:
-                    # FiLM on the residual stream: h <- h*(1+g) + b,
-                    # zero-init so iteration 0 / untrained = identity.
-                    txt = txt * (1.0 + film[layer_i, 0].to(txt.dtype)) + film[layer_i, 1].to(txt.dtype)
-                txt = block(
-                    txt,
-                    txt_shape=txt_shape_patched,
-                    txt_q_shape=txt_q_shape,
-                    emb=emb_per_layer[layer_i],
-                    update_kv=loop_update_kv,
-                    use_kv_cache=use_kv_cache,
-                    attn_block_mask=attn_mask,
-                    cpu_txt_shape=cpu_txt_shape,
-                    k_position_ids=k_position_ids,
-                    q_position_ids=q_position_ids,
-                )
+            # TBPTT: iterations before the last ``tbptt_k`` ones are
+            # recomputed state only - no graph is built through them.
+            grad_ctx = (
+                torch.no_grad() if (self.tbptt_k > 0 and loop_idx < tbptt_free) else contextlib.nullcontext()
+            )
+            with grad_ctx:
+                for layer_i, block in enumerate(self.blocks):
+                    if film is not None:
+                        # FiLM on the residual stream: h <- h*(1+g) + b,
+                        # zero-init so iteration 0 / untrained = identity.
+                        txt = txt * (1.0 + film[layer_i, 0].to(txt.dtype)) + film[layer_i, 1].to(txt.dtype)
+                    txt = block(
+                        txt,
+                        txt_shape=txt_shape_patched,
+                        txt_q_shape=txt_q_shape,
+                        emb=emb_per_layer[layer_i],
+                        update_kv=loop_update_kv,
+                        use_kv_cache=use_kv_cache,
+                        attn_block_mask=attn_mask,
+                        cpu_txt_shape=cpu_txt_shape,
+                        k_position_ids=k_position_ids,
+                        q_position_ids=q_position_ids,
+                    )
+            if self._probe is not None and loop_idx > 0:
+                with torch.no_grad():
+                    h = txt.float()
+                    rms = h.pow(2).mean().sqrt().item()
+                    hn = F.normalize(h, dim=-1)
+                    sim = hn @ hn.t()
+                    n = sim.shape[0]
+                    off = (sim.sum() - sim.diagonal().sum()) / max(1, n * (n - 1))
+                    self._probe.append((loop_idx, rms, off.item()))
+            # TBPTT boundary: detach the state before the grad-enabled tail
+            # and clear the autocast cast cache so the tail re-casts the
+            # weights with grad tracking (autocast caches bf16 casts per
+            # context; a cast made under no_grad would otherwise be reused).
+            if self.tbptt_k > 0 and loop_idx + 1 == tbptt_free:
+                torch.clear_autocast_cache()
+                txt = txt.detach()
         self._loop_state["idx"] = 0
 
         if self.txt_out_norm is not None:

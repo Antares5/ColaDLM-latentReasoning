@@ -70,6 +70,8 @@ class ColaDiTConfig(PretrainedConfig):
         loop_reinject: bool = False,
         loop_cond: str = "global",
         loop_lora_rank: int = 0,
+        loop_adapter: bool = False,
+        loop_renorm: bool = False,
         **kwargs,
     ):
         self.txt_in_channels = txt_in_channels
@@ -100,4 +102,12 @@ class ColaDiTConfig(PretrainedConfig):
         # Persisted in the checkpoint config; env COLA_DIT_LOOP_LORA_RANK
         # overrides at load.
         self.loop_lora_rank = loop_lora_rank
+        # Huginn-style concat adapter for input injection at loop
+        # iterations r >= 1 (h <- A([h; x_emb]), A init [I | 0]).
+        # Persisted in the checkpoint config; env COLA_DIT_LOOP_ADAPTER
+        # overrides at load.
+        self.loop_adapter = loop_adapter
+        # RMS renormalisation of the hidden state at loop boundaries
+        # (anti-collapse); env COLA_DIT_LOOP_RENORM overrides at load.
+        self.loop_renorm = loop_renorm
         super().__init__(**kwargs)
