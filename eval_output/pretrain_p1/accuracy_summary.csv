@@ -1,0 +1,10 @@
+task,p1f_r1,p1f_r2
+lambada,40.00,0.00
+mmlu,15.00,
+obqa,,
+hellaswag,,
+race,,
+siqa,,
+squad,,
+story_cloze,,
+tasks_average,27.50,0.00

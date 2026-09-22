@@ -1,0 +1,10 @@
+task,bf16base_r1
+lambada,45.00
+mmlu,
+obqa,
+hellaswag,
+race,
+siqa,
+squad,
+story_cloze,
+tasks_average,45.00
