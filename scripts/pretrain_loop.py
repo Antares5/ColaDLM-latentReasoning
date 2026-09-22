@@ -241,9 +241,11 @@ def main() -> int:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     args = parse_args()
     rank, world, local = rank_info()
-    if is_dist():
-        torch.distributed.init_process_group(backend="nccl")
-        torch.cuda.set_device(local)
+    # NOTE: init_process_group is deferred until after the (potentially
+    # ~1h) VAE encode: ranks 1..N would otherwise hit the default 600s
+    # store timeout waiting for rank 0. The encode decision uses the
+    # torchrun-provided LOCAL_RANK before any NCCL setup.
+    torch.cuda.set_device(local)
     device = torch.device("cuda", local)
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
@@ -274,6 +276,9 @@ def main() -> int:
         del vae, windows, z0_stream
         torch.cuda.empty_cache()
     if is_dist():
+        import datetime
+
+        torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=3))
         torch.distributed.barrier()
     z0_all = torch.load(cache_path)  # (N, seq_len, d) bf16, CPU
     n_train = len(z0_all) - args.val_windows
