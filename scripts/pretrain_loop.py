@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r_choices", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--tbptt_k", type=int, default=2)
     p.add_argument("--adapter", type=int, default=1, help="Enable the concat loop adapter (0 = off)")
+    p.add_argument("--bf16", type=int, default=0, help="Load/train the model in pure bf16 (halves weight+grad memory)")
     p.add_argument("--loop_renorm", type=int, default=0,
                    help="RMS-renormalise the hidden state at every loop boundary (anti-collapse)")
     p.add_argument("--cond_lr_mult", type=float, default=1.0)
@@ -172,7 +173,10 @@ def _commit_history(dit, hist, device):
     context so its weight casts are never reused by the grad pass)."""
     h = hist.to(torch.bfloat16)
     h_shape = torch.tensor([[h.shape[0]]], device=device, dtype=torch.long)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    # cache_enabled=False: the per-context bf16 weight-cast cache would
+    # otherwise hold a full second copy of the model (~3.6GB) for the
+    # whole commit pass.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, cache_enabled=False):
         dit(txt=h, txt_shape=h_shape, txt_q_shape=h_shape,
             timestep=torch.zeros(h.shape[0], device=device, dtype=torch.bfloat16),
             update_kv=True, use_kv_cache=True)
@@ -197,6 +201,10 @@ def drift_twopass(dit, z_t, hist, t, device):
         k_shape = torch.tensor([[BLOCK_SIZE]], device=device, dtype=torch.long)
     q_shape = torch.tensor([[BLOCK_SIZE]], device=device, dtype=torch.long)
     ts = torch.full((BLOCK_SIZE,), t, device=device, dtype=torch.bfloat16)
+    # cache_enabled=True here (grad pass): the per-context cast cache holds
+    # ONE bf16 cast per weight, reused across all loop iterations. With the
+    # cache disabled, every loop re-casts and autograd saves a separate
+    # ~3.6GB set of casts per loop (14GB at r=4).
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         out = dit(txt=z_t.to(torch.bfloat16), txt_shape=k_shape, txt_q_shape=q_shape,
                   timestep=ts, update_kv=False, use_kv_cache=hist is not None and hist.shape[0] > 0).txt_sample
@@ -278,7 +286,8 @@ def main() -> int:
     # ---------------- model ----------------
     if rank == 0:
         print(f"[train] loading DiT: {args.dit_path}", flush=True)
-    dit = ColaDiTModel.from_pretrained(args.dit_path).to(device)
+    load_dtype = torch.bfloat16 if args.bf16 else torch.float32
+    dit = ColaDiTModel.from_pretrained(args.dit_path, torch_dtype=load_dtype).to(device)
     if args.adapter:
         dit.config.loop_adapter = True  # persist into saved checkpoints
     if args.loop_renorm:
