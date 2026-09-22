@@ -86,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r_dist", choices=["lognormal", "uniform"], default="lognormal")
     p.add_argument("--r_choices", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--tbptt_k", type=int, default=2)
+    p.add_argument("--adapter", type=int, default=1, help="Enable the concat loop adapter (0 = off)")
     p.add_argument("--loop_renorm", type=int, default=0,
                    help="RMS-renormalise the hidden state at every loop boundary (anti-collapse)")
     p.add_argument("--cond_lr_mult", type=float, default=1.0)
@@ -204,6 +205,7 @@ def drift_twopass(dit, z_t, hist, t, device):
     return out.float()
 
 
+@torch.no_grad()
 def validate(dit, val_z0, args, device) -> dict[int, float]:
     """Mean conditional FM loss at R in {1,2,4,8} on fixed (window, block, t) cells."""
     n_blocks = args.seq_len // BLOCK_SIZE
@@ -243,7 +245,7 @@ def main() -> int:
 
     # Recurrence machinery via env (construction-time switches).
     os.environ["COLA_DIT_TBPTT_K"] = str(args.tbptt_k)
-    os.environ["COLA_DIT_LOOP_ADAPTER"] = "1"
+    os.environ["COLA_DIT_LOOP_ADAPTER"] = "1" if args.adapter else "0"
     if args.loop_renorm:
         os.environ["COLA_DIT_LOOP_RENORM"] = "1"
 
@@ -277,7 +279,8 @@ def main() -> int:
     if rank == 0:
         print(f"[train] loading DiT: {args.dit_path}", flush=True)
     dit = ColaDiTModel.from_pretrained(args.dit_path).to(device)
-    dit.config.loop_adapter = True  # persist into saved checkpoints
+    if args.adapter:
+        dit.config.loop_adapter = True  # persist into saved checkpoints
     if args.loop_renorm:
         dit.config.loop_renorm = True  # persist into saved checkpoints
     dit.train()
