@@ -83,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r_mean", type=float, default=3.0, help="Mean recurrence of the log-normal Poisson sampler")
     p.add_argument("--r_sigma", type=float, default=0.5)
     p.add_argument("--r_max", type=int, default=8)
+    p.add_argument("--r_dist", choices=["lognormal", "uniform"], default="lognormal")
+    p.add_argument("--r_choices", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--tbptt_k", type=int, default=2)
     p.add_argument("--loop_renorm", type=int, default=0,
                    help="RMS-renormalise the hidden state at every loop boundary (anti-collapse)")
@@ -118,9 +120,13 @@ def lr_at(step: int, args) -> float:
 
 
 def sample_r(step: int, args) -> int:
-    """Log-normal Poisson recurrence count (Huginn Eq. 1-2), seeded per
-    step so every DDP rank draws the same r (locked-step sampling)."""
+    """Recurrence count for this step. Lognormal: log-normal Poisson
+    (Huginn Eq. 1-2). Uniform: uniform over ``args.r_choices``. Seeded
+    per step so every DDP rank draws the same r (locked-step sampling)."""
     g = torch.Generator().manual_seed(args.seed * 100003 + step)
+    if args.r_dist == "uniform":
+        i = int(torch.randint(0, len(args.r_choices), (1,), generator=g).item())
+        return int(args.r_choices[i])
     tau = torch.randn(1, generator=g).item() * args.r_sigma + (math.log(args.r_mean) - 0.5 * args.r_sigma**2)
     lam = math.exp(tau)
     r = torch.poisson(torch.tensor([lam]), generator=g).item() + 1
