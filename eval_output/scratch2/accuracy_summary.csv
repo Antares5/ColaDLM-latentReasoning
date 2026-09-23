@@ -1,0 +1,10 @@
+task,plain3k_r1,plain3k_r2,ra3k_r1,ra3k_r2
+lambada,0.00,0.00,0.00,0.00
+mmlu,,,,
+obqa,,,,
+hellaswag,,,,
+race,,,,
+siqa,,,,
+squad,,,,
+story_cloze,,,,
+tasks_average,0.00,0.00,0.00,0.00
