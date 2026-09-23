@@ -1,0 +1,10 @@
+task,s1_r1,s1_r2,s1_r4
+lambada,0.00,0.00,0.00
+mmlu,0.00,0.50,0.00
+obqa,,,
+hellaswag,,,
+race,,,
+siqa,,,
+squad,,,
+story_cloze,,,
+tasks_average,0.00,0.25,0.00
