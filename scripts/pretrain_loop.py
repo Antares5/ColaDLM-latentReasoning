@@ -64,7 +64,7 @@ BLOCK_SIZE = 16
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dit_path", required=True)
+    p.add_argument("--dit_path", default="")
     p.add_argument("--vae_path", required=True)
     p.add_argument("--tokenizer_path", required=True)
     p.add_argument("--out_dir", required=True)
@@ -88,6 +88,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tbptt_k", type=int, default=2)
     p.add_argument("--adapter", type=int, default=1, help="Enable the concat loop adapter (0 = off)")
     p.add_argument("--bf16", type=int, default=0, help="Load/train the model in pure bf16 (halves weight+grad memory)")
+    p.add_argument("--from_scratch", type=int, default=0, help="Train a small DiT from random init (ignore dit_path)")
+    p.add_argument("--sc_layers", type=int, default=12)
+    p.add_argument("--sc_dim", type=int, default=1024)
+    p.add_argument("--sc_heads", type=int, default=8)
+    p.add_argument("--sc_head_dim", type=int, default=128)
+    p.add_argument("--sc_expand", type=int, default=4)
     p.add_argument("--loop_renorm", type=int, default=0,
                    help="RMS-renormalise the hidden state at every loop boundary (anti-collapse)")
     p.add_argument("--cond_lr_mult", type=float, default=1.0)
@@ -240,6 +246,7 @@ def validate(dit, val_z0, args, device) -> dict[int, float]:
 def main() -> int:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     args = parse_args()
+    assert args.from_scratch or args.dit_path, "--dit_path is required unless --from_scratch 1"
     rank, world, local = rank_info()
     # NOTE: init_process_group is deferred until after the (potentially
     # ~1h) VAE encode: ranks 1..N would otherwise hit the default 600s
@@ -292,7 +299,34 @@ def main() -> int:
     if rank == 0:
         print(f"[train] loading DiT: {args.dit_path}", flush=True)
     load_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    dit = ColaDiTModel.from_pretrained(args.dit_path, torch_dtype=load_dtype).to(device)
+    if args.from_scratch:
+        # Small from-scratch DiT: verifies whether loop-native iteration
+        # can be co-adapted from random initialisation at all (the
+        # hypothesis every checkpoint fine-tuning run falsified).
+        from cola_dlm.configuration_cola_dit import ColaDiTConfig
+
+        cfg = ColaDiTConfig(
+            txt_in_channels=16,
+            txt_out_channels=16,
+            txt_dim=args.sc_dim,
+            emb_dim=args.sc_dim,
+            heads=args.sc_heads,
+            head_dim=args.sc_head_dim,
+            expand_ratio=args.sc_expand,
+            num_layers=args.sc_layers,
+            patch_size=1,
+            rope_dim=96,
+            block_size=BLOCK_SIZE,
+            loop_adapter=bool(args.adapter),
+            loop_renorm=bool(args.loop_renorm),
+        )
+        dit = ColaDiTModel(cfg).to(load_dtype).to(device)
+        if rank == 0:
+            n_params = sum(p.numel() for p in dit.parameters())
+            print(f"[train] from-scratch DiT: {n_params / 1e6:.0f}M params "
+                  f"({args.sc_layers}x{args.sc_dim})", flush=True)
+    else:
+        dit = ColaDiTModel.from_pretrained(args.dit_path, torch_dtype=load_dtype).to(device)
     if args.adapter:
         dit.config.loop_adapter = True  # persist into saved checkpoints
     if args.loop_renorm:
