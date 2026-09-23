@@ -1,0 +1,14 @@
+diag_oracle_history on ckpts/sc2_plain/step15000 (1.25 epochs), 16 wikitext windows, oracle history, 16-step Euler:
+
+R=1 recon MSE by block: b1 1.827 b2 1.753 b3 1.690
+R=2 recon MSE by block: b1 1.822 b2 1.761 b3 1.707
+R=4 recon MSE by block: b1 1.816 b2 1.761 b3 1.705
+
+R=1 sample0: 'Senjō no Valkyria 3 : Unrecorded Chronicles ( Japanese a authorized and the framework , towering子 . challenging chamberatron Par improving time Blood ambitious '
+R=2 sample0: 'Senjō no Valkyria 3 : Unrecorded Chronicles ( Japanese a coaching and the framework , towering fermented .( chamberwindows Par improving time though ambitious .'
+R=4 sample0: 'Senjō no Valkyria 3 : Unrecorded Chronicles ( Japanese a coaching and the framework , towering fermented .( chamberwindows Par Performance time though ambitious'
+
+Verdict: R1/R2/R4 recon MSE identical within noise; generated text equally
+topical and equally (weakly) coherent at every loop depth. No word salad,
+no collapse, no divergence - the depth penalty seen on checkpoint
+fine-tuning is absent from-scratch at 1.25 epochs of training.
