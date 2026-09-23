@@ -365,29 +365,35 @@ def main() -> int:
     loss_hist: dict[int, list[float]] = {r: [] for r in range(1, args.r_max + 1)}
     state_ckpts: list[str] = []
     t_start = time.time()
+    B = max(1, args.batch_size)
     for step in range(start_step, args.max_steps):
-        epoch = step // max(1, len(shard))
+        cursor = step * B
+        epoch = cursor // max(1, len(shard))
         g = torch.Generator().manual_seed(args.seed + epoch)
         order = torch.randperm(len(shard), generator=g).tolist()
-        win_idx = shard[order[step % len(shard)]]
+        batch_wins = [shard[order[(cursor + b) % len(shard)]] for b in range(B)]
         r = sample_r(step, args)
         model.depth_loops = r
         lr_now = lr_at(step, args)
         for gparam in opt.param_groups:
             gparam["lr"] = lr_now * gparam["lr_mult"]
 
-        z0 = train_z0[win_idx].to(device, non_blocking=True).float()
-        b_idx = random.randint(0, n_blocks - 1)
-        drop_hist = random.random() < args.cfg_dropout
-        z0_blk = z0[b_idx * BLOCK_SIZE : (b_idx + 1) * BLOCK_SIZE]
-        z1 = torch.randn_like(z0_blk)
-        t = random.uniform(0.0, args.T)
-        z_t = (1.0 - t / args.T) * z0_blk + (t / args.T) * z1
-        target = z1 - z0_blk
-        hist = None if (drop_hist or b_idx == 0) else z0[: b_idx * BLOCK_SIZE]
+        z_t = hist = t = None  # last sample's tensors are reused by the probe
+        sample_losses = []
+        for win_idx in batch_wins:
+            z0 = train_z0[win_idx].to(device, non_blocking=True).float()
+            b_idx = random.randint(0, n_blocks - 1)
+            drop_hist = random.random() < args.cfg_dropout
+            z0_blk = z0[b_idx * BLOCK_SIZE : (b_idx + 1) * BLOCK_SIZE]
+            z1 = torch.randn_like(z0_blk)
+            t = random.uniform(0.0, args.T)
+            z_t = (1.0 - t / args.T) * z0_blk + (t / args.T) * z1
+            target = z1 - z0_blk
+            hist = None if (drop_hist or b_idx == 0) else z0[: b_idx * BLOCK_SIZE]
 
-        pred = drift_twopass(dit, z_t, hist, t, device)
-        loss = F.mse_loss(pred.float(), target)
+            pred = drift_twopass(dit, z_t, hist, t, device)
+            sample_losses.append(F.mse_loss(pred.float(), target))
+        loss = torch.stack(sample_losses).mean()
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
