@@ -1,0 +1,10 @@
+task,p2s20k_r1,p2s20k_r2,p2s20k_r4
+lambada,34.50,0.50,0.00
+mmlu,14.50,0.50,2.00
+obqa,,,
+hellaswag,,,
+race,,,
+siqa,,,
+squad,,,
+story_cloze,,,
+tasks_average,24.50,0.50,1.00
