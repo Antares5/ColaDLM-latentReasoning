@@ -1,0 +1,8 @@
+diag_oracle_history on ckpts/sc2_plain/step80000 (6.6 epochs), 16 wikitext windows, oracle history, 16-step Euler:
+
+R=1 recon MSE by block: b1 1.864 b2 1.797 b3 1.771
+R=2 recon MSE by block: b1 1.869 b2 1.799 b3 1.780
+R=4 recon MSE by block: b1 1.867 b2 1.801 b3 1.780
+
+R-parity intact at the end of training (identical recon error and equally
+weak-but-topical continuations at all loop depths; cf. step15000 probe).
