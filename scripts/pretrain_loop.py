@@ -104,6 +104,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--keep_states", type=int, default=2, help="Optimizer-state checkpoints to keep")
     p.add_argument("--cache_dir", default="pretrain_cache")
+    p.add_argument("--cache_paths", default="",
+                   help="Comma-separated list of existing latent stream .pt files "
+                        "(memory-mapped; bypasses the encode step). Val set = tail of the LAST file.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--optimizer", default="adamw8bit", choices=["adamw8bit", "adamw"])
     p.add_argument("--resume", default="", help="Path to a state checkpoint dir to resume from")
@@ -270,7 +273,10 @@ def main() -> int:
     tag = f"{args.dataset_config}_seq{args.seq_len}_lines{args.dataset_lines}"
     cache_path = os.path.join(args.cache_dir, f"{tag}_z0.pt")
     meta_path = os.path.join(args.cache_dir, f"{tag}_meta.json")
-    if rank == 0 and not os.path.exists(cache_path):
+    cache_paths = [p.strip() for p in args.cache_paths.split(",") if p.strip()]
+    if not cache_paths:
+        cache_paths = [cache_path]
+    if rank == 0 and not cache_paths[1:] and not os.path.exists(cache_path):
         tokenizer = Tokenizer.from_file(args.tokenizer_path)
         windows = build_packed_windows(tokenizer, args, rank)
         print(f"[data] {len(windows)} packed windows of {args.seq_len} tokens", flush=True)
@@ -287,9 +293,27 @@ def main() -> int:
 
         torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=3))
         torch.distributed.barrier()
-    z0_all = torch.load(cache_path)  # (N, seq_len, d) bf16, CPU
-    n_train = len(z0_all) - args.val_windows
-    train_z0, val_z0 = z0_all[:n_train], z0_all[n_train:]
+
+    # Multiple stream shards are memory-mapped (48GB+ streams must not sit
+    # in RAM); a global window index resolves to (shard, local offset).
+    streams = [torch.load(p, mmap=True) for p in cache_paths]  # list of (N_i, seq_len, d) bf16
+    offsets = [0]
+    for s in streams:
+        offsets.append(offsets[-1] + len(s))
+    n_total = offsets[-1]
+    n_train = n_total - args.val_windows
+
+    def get_window(idx: int) -> torch.Tensor:
+        for si in range(len(streams)):
+            if idx < offsets[si + 1]:
+                return streams[si][idx - offsets[si]]
+        raise IndexError(idx)
+
+    # val set = tail of the LAST stream file (keep wikitext last for
+    # continuity of the val metric across the whole run).
+    val_z0 = torch.stack([get_window(i) for i in range(n_train, n_total)])
+    if rank == 0:
+        print(f"[data] {len(streams)} stream shards, train windows {n_train}, val {len(val_z0)}", flush=True)
     # rank-sharded window order (reshuffled every epoch by seeded RNG)
     shard = list(range(rank, n_train, world))
     if rank == 0:
@@ -381,7 +405,7 @@ def main() -> int:
         z_t = hist = t = None  # last sample's tensors are reused by the probe
         sample_losses = []
         for win_idx in batch_wins:
-            z0 = train_z0[win_idx].to(device, non_blocking=True).float()
+            z0 = get_window(win_idx).to(device, non_blocking=True).float()
             b_idx = random.randint(0, n_blocks - 1)
             drop_hist = random.random() < args.cfg_dropout
             z0_blk = z0[b_idx * BLOCK_SIZE : (b_idx + 1) * BLOCK_SIZE]
