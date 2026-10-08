@@ -1,0 +1,6 @@
+diag_oracle_history on ckpts/sc2_plain/step265000 (6.07B tokens), 16 wikitext windows, oracle history:
+
+R=1 recon MSE: b1 1.880 b2 1.796 b3 1.758
+R=2 recon MSE: b1 1.892 b2 1.806 b3 1.789
+R=4 recon MSE: b1 1.886 b2 1.797 b3 1.785
+R-parity intact at the end of the 3-day run.
